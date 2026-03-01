@@ -1,17 +1,17 @@
 # main.py
-# NSE Screenshot → OCR → Dataset + Dashboard (Streamlit Cloud friendly)
+# Faida / NSE screenshot -> OCR -> dataset (correct columns) -> dashboard
 #
-# Requirements (requirements.txt):
-#   streamlit
-#   pandas
-#   pillow
-#   numpy
-#   pytesseract
-#   opencv-python-headless
+# requirements.txt:
+# streamlit
+# pandas
+# pillow
+# numpy
+# pytesseract
+# opencv-python-headless
 #
-# System packages (packages.txt):
-#   tesseract-ocr
-#   tesseract-ocr-eng
+# packages.txt:
+# tesseract-ocr
+# tesseract-ocr-eng
 
 import os
 import io
@@ -40,12 +40,12 @@ except Exception:
     PYTESSERACT_OK = False
 
 TESS_BIN = shutil.which("tesseract")
-TESSERACT_OK = bool(TESS_BIN) and PYTESSERACT_OK
+OCR_READY = bool(TESS_BIN) and PYTESSERACT_OK
 
 # ----------------------------
 # App config
 # ----------------------------
-APP_TITLE = "NSE Screenshot → Dataset + Dashboard"
+APP_TITLE = "NSE Screenshot → Dataset + Dashboard (Faida Watchlist)"
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "screenshots"
 DB_PATH = DATA_DIR / "app.db"
@@ -55,7 +55,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Upload NSE market screenshots, extract table data, store a dataset, and view dashboards.")
+st.caption("Upload Faida/NSE watchlist screenshots → extract Symbol/Last Price/Last Qty/Bid Qty/Bid Price → dataset + dashboard.")
 
 with st.sidebar:
     st.header("System status")
@@ -67,10 +67,8 @@ with st.sidebar:
         st.success(f"Tesseract found: {TESS_BIN}")
     else:
         st.error("Tesseract NOT found (check packages.txt)")
-    if TESSERACT_OK:
-        st.success("OCR: READY ✅")
-    else:
-        st.warning("OCR: Not ready (install both pytesseract + tesseract-ocr).")
+    st.write("---")
+    st.write("If extraction is poor, increase crop sliders and upscale.")
 
 # ----------------------------
 # DB helpers
@@ -93,22 +91,24 @@ def db_conn():
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_uploads_date ON uploads(upload_date)")
 
+    # Correct schema for the Faida watchlist table
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS market_quotes (
+        CREATE TABLE IF NOT EXISTS watchlist_rows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             upload_id INTEGER NOT NULL,
             quote_date TEXT NOT NULL,
             symbol TEXT NOT NULL,
             last_price REAL,
-            volume INTEGER,
-            direction TEXT,
+            last_qty INTEGER,
+            bid_qty INTEGER,
+            bid_price REAL,
             raw_line TEXT,
             created_at TEXT NOT NULL,
             FOREIGN KEY(upload_id) REFERENCES uploads(id)
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_quotes_date ON market_quotes(quote_date)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_quotes_symbol ON market_quotes(symbol)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_date ON watchlist_rows(quote_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_symbol ON watchlist_rows(symbol)")
 
     conn.commit()
     return conn
@@ -128,29 +128,43 @@ def insert_upload(upload_date: str, label: str | None, notes: str | None,
     CONN.commit()
     return int(cur.lastrowid)
 
-def fetch_uploads(upload_date: str | None = None, limit: int = 500) -> pd.DataFrame:
+def fetch_uploads(limit: int = 1000) -> pd.DataFrame:
     cur = CONN.cursor()
-    if upload_date:
-        cur.execute(
-            """SELECT id, upload_date, label, notes, filename, filepath, mimetype, uploaded_at, ocr_text
-               FROM uploads WHERE upload_date = ?
-               ORDER BY id DESC LIMIT ?""",
-            (upload_date, limit),
-        )
-    else:
-        cur.execute(
-            """SELECT id, upload_date, label, notes, filename, filepath, mimetype, uploaded_at, ocr_text
-               FROM uploads ORDER BY id DESC LIMIT ?""",
-            (limit,),
-        )
+    cur.execute(
+        """SELECT id, upload_date, label, notes, filename, filepath, mimetype, uploaded_at, ocr_text
+           FROM uploads ORDER BY id DESC LIMIT ?""",
+        (limit,),
+    )
     rows = cur.fetchall()
     cols = ["id", "upload_date", "label", "notes", "filename", "filepath", "mimetype", "uploaded_at", "ocr_text"]
     return pd.DataFrame(rows, columns=cols)
 
-def fetch_quotes(date_filter: str | None = None, symbol: str | None = None, limit: int = 50000) -> pd.DataFrame:
+def insert_watchlist_rows(upload_id: int, quote_date: str, rows: list[dict]):
+    now = datetime.now().isoformat(timespec="seconds")
     cur = CONN.cursor()
-    q = """SELECT id, upload_id, quote_date, symbol, last_price, volume, direction, raw_line, created_at
-           FROM market_quotes WHERE 1=1"""
+    for r in rows:
+        cur.execute(
+            """INSERT INTO watchlist_rows
+               (upload_id, quote_date, symbol, last_price, last_qty, bid_qty, bid_price, raw_line, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                upload_id,
+                quote_date,
+                r.get("symbol"),
+                r.get("last_price"),
+                r.get("last_qty"),
+                r.get("bid_qty"),
+                r.get("bid_price"),
+                r.get("raw_line"),
+                now,
+            )
+        )
+    CONN.commit()
+
+def fetch_watchlist(date_filter: str | None = None, symbol: str | None = None, limit: int = 100000) -> pd.DataFrame:
+    cur = CONN.cursor()
+    q = """SELECT id, upload_id, quote_date, symbol, last_price, last_qty, bid_qty, bid_price, raw_line, created_at
+           FROM watchlist_rows WHERE 1=1"""
     params = []
     if date_filter:
         q += " AND quote_date = ?"
@@ -163,145 +177,152 @@ def fetch_quotes(date_filter: str | None = None, symbol: str | None = None, limi
 
     cur.execute(q, tuple(params))
     rows = cur.fetchall()
-    cols = ["id","upload_id","quote_date","symbol","last_price","volume","direction","raw_line","created_at"]
+    cols = ["id","upload_id","quote_date","symbol","last_price","last_qty","bid_qty","bid_price","raw_line","created_at"]
     return pd.DataFrame(rows, columns=cols)
 
-def insert_quotes(upload_id: int, quote_date: str, quotes: list[dict]):
-    now = datetime.now().isoformat(timespec="seconds")
-    cur = CONN.cursor()
-    for r in quotes:
-        cur.execute(
-            """INSERT INTO market_quotes
-               (upload_id, quote_date, symbol, last_price, volume, direction, raw_line, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                upload_id,
-                quote_date,
-                r.get("symbol"),
-                r.get("last_price"),
-                r.get("volume"),
-                r.get("direction"),
-                r.get("raw_line"),
-                now,
-            )
-        )
-    CONN.commit()
-
 # ----------------------------
-# OCR + parsing
+# OCR + preprocessing
 # ----------------------------
-def preprocess_for_ocr(pil_img: Image.Image,
-                       crop_right_pct: float = 0.30,
-                       crop_top_pct: float = 0.00,
-                       crop_bottom_pct: float = 0.00,
-                       upscale: float = 2.5) -> np.ndarray:
+def preprocess_for_ocr(
+    pil_img: Image.Image,
+    crop_left_pct: float = 0.20,
+    crop_right_pct: float = 0.35,
+    crop_top_pct: float = 0.10,
+    crop_bottom_pct: float = 0.10,
+    upscale: float = 2.5,
+) -> np.ndarray:
     """
-    Preprocess screenshot:
-    - Crop right-side action buttons (B/S/trash)
-    - Upscale
-    - Grayscale + denoise
-    - Otsu threshold + auto-invert
+    For full-screen Faida screenshots, we need to crop away:
+      - left sidebar
+      - right panels/buttons
+      - top nav
+      - bottom panels
+    Then enhance for OCR.
     """
     img = np.array(pil_img.convert("RGB"))
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
     h, w = img.shape[:2]
-    right_crop = int(w * (1.0 - crop_right_pct))
-    top_crop = int(h * crop_top_pct)
-    bottom_crop = int(h * (1.0 - crop_bottom_pct))
+    x1 = int(w * crop_left_pct)
+    x2 = int(w * (1.0 - crop_right_pct))
+    y1 = int(h * crop_top_pct)
+    y2 = int(h * (1.0 - crop_bottom_pct))
 
-    img = img[top_crop:bottom_crop, :right_crop]
+    # guard against bad crops
+    x1 = max(0, min(x1, w - 2))
+    x2 = max(x1 + 1, min(x2, w))
+    y1 = max(0, min(y1, h - 2))
+    y2 = max(y1 + 1, min(y2, h))
+
+    cropped = img[y1:y2, x1:x2]
 
     if upscale and upscale != 1.0:
-        img = cv2.resize(img, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
+        cropped = cv2.resize(cropped, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
     gray = cv2.bilateralFilter(gray, 7, 50, 50)
 
+    # Otsu threshold
     _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    white_ratio = (th > 200).mean()
-    if white_ratio < 0.5:
+    # auto-invert if needed
+    if (th > 200).mean() < 0.5:
         th = cv2.bitwise_not(th)
 
     return th
 
 def ocr_image(cv_img: np.ndarray) -> str:
-    if not TESSERACT_OK:
+    if not OCR_READY:
         raise RuntimeError("OCR not ready. Ensure packages.txt (tesseract) + requirements.txt (pytesseract).")
 
-    # Better spacing preservation for table-like lines
+    # Better for table rows + spacing
     config = r"--oem 3 --psm 6 -c preserve_interword_spaces=1"
     return pytesseract.image_to_string(cv_img, config=config)
 
-# Accept comma thousands, optional decimals, and tolerate OCR noise around spaces
-ROW_RE = re.compile(
-    r"""
-    ^\s*
-    (?P<symbol>[A-Z0-9\-]{2,12})
-    \s+
-    (?P<price>\d{1,3}(?:,\d{3})*(?:\.\d+)?)
-    \s+
-    (?P<volume>\d{1,3}(?:,\d{3})*)
-    """,
-    re.VERBOSE
-)
+# ----------------------------
+# Parsing (TOKEN-BASED) to avoid wrong columns
+# ----------------------------
+NUM_RE = re.compile(r"^\d{1,3}(?:,\d{3})*(?:\.\d+)?$")
 
-def parse_ocr_text_to_quotes(ocr_text: str) -> list[dict]:
-    quotes = []
+def parse_float(tok: str):
+    try:
+        return float(tok.replace(",", ""))
+    except Exception:
+        return None
 
-    for line in ocr_text.splitlines():
-        raw = line.strip()
+def parse_int(tok: str):
+    try:
+        return int(tok.replace(",", ""))
+    except Exception:
+        return None
+
+def clean_line(line: str) -> str:
+    # remove weird OCR chars and normalize spaces
+    line = line.replace("\t", " ")
+    line = re.sub(r"\s{2,}", " ", line)
+    return line.strip()
+
+def parse_watchlist_rows(ocr_text: str) -> list[dict]:
+    """
+    Expected logical row (from Faida watchlist):
+      SYMBOL  LastPrice  LastQty  BidQty  BidPrice
+    We do token-based parsing:
+      - first token that looks like a symbol
+      - then next 4 numeric tokens in order
+    """
+    rows = []
+    for raw in ocr_text.splitlines():
+        raw = clean_line(raw)
         if not raw:
             continue
 
-        # Basic cleanup
-        raw = raw.replace("\t", " ")
-        raw = re.sub(r"\s{2,}", " ", raw)
-
-        # A few common OCR misreads: 'I'/'l' as '1' in numbers can be handled by regex later; keep minimal here.
-
-        m = ROW_RE.match(raw)
-        if not m:
+        tokens = raw.split(" ")
+        if len(tokens) < 2:
             continue
 
-        symbol = m.group("symbol").upper().strip()
-        price_str = m.group("price").replace(",", "")
-        vol_str = m.group("volume").replace(",", "")
+        # symbol candidate is usually first token
+        symbol = tokens[0].upper()
 
-        try:
-            last_price = float(price_str)
-        except Exception:
-            last_price = None
+        # quick filter: symbol must look like ABSA, KPLC-P, SCBK
+        if not re.match(r"^[A-Z0-9\-]{2,12}$", symbol):
+            continue
 
-        try:
-            volume = int(vol_str)
-        except Exception:
-            volume = None
+        # collect numeric tokens from the rest
+        nums = [t for t in tokens[1:] if NUM_RE.match(t)]
+        if len(nums) < 2:
+            # not enough to be useful
+            continue
 
-        quotes.append({
+        # map in expected order
+        last_price = parse_float(nums[0]) if len(nums) >= 1 else None
+        last_qty   = parse_int(nums[1])   if len(nums) >= 2 else None
+        bid_qty    = parse_int(nums[2])   if len(nums) >= 3 else None
+        bid_price  = parse_float(nums[3]) if len(nums) >= 4 else None
+
+        rows.append({
             "symbol": symbol,
             "last_price": last_price,
-            "volume": volume,
-            "direction": "UNKNOWN",
+            "last_qty": last_qty,
+            "bid_qty": bid_qty,
+            "bid_price": bid_price,
             "raw_line": raw
         })
 
-    # de-duplicate by symbol (keep last)
+    # Deduplicate by symbol (keep last)
     dedup = {}
-    for q in quotes:
-        dedup[q["symbol"]] = q
+    for r in rows:
+        dedup[r["symbol"]] = r
     return list(dedup.values())
 
 # ----------------------------
 # Export helpers
 # ----------------------------
-def build_zip_bytes(quotes_df: pd.DataFrame, uploads_df: pd.DataFrame) -> bytes:
+def build_zip_bytes(watch_df: pd.DataFrame, uploads_df: pd.DataFrame) -> bytes:
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("quotes.csv", quotes_df.to_csv(index=False))
+        z.writestr("watchlist_rows.csv", watch_df.to_csv(index=False))
         z.writestr("uploads.csv", uploads_df.to_csv(index=False))
-        z.writestr("quotes.json", json.dumps(quotes_df.fillna("").to_dict(orient="records"), indent=2))
+        z.writestr("watchlist_rows.json", json.dumps(watch_df.fillna("").to_dict(orient="records"), indent=2))
         z.writestr("uploads.json", json.dumps(uploads_df.fillna("").to_dict(orient="records"), indent=2))
 
         for _, r in uploads_df.iterrows():
@@ -313,7 +334,7 @@ def build_zip_bytes(quotes_df: pd.DataFrame, uploads_df: pd.DataFrame) -> bytes:
     return bio.read()
 
 # ----------------------------
-# UI tabs
+# UI
 # ----------------------------
 tab_upload, tab_dashboard, tab_downloads = st.tabs(
     ["📤 Upload + Extract", "📊 Dashboard", "⬇️ Download Dataset"]
@@ -323,26 +344,28 @@ tab_upload, tab_dashboard, tab_downloads = st.tabs(
 # Upload + Extract
 # ----------------------------
 with tab_upload:
-    st.subheader("1) Upload screenshot  2) Extract table  3) Save dataset")
+    st.subheader("Upload screenshot → Extract watchlist table → Save dataset")
 
     col1, col2 = st.columns([1, 1])
     with col1:
         quote_date = st.date_input("Quote date", value=date.today())
-        label = st.text_input("Label (optional)", value="NSE Market Watch Screenshot")
+        label = st.text_input("Label", value="Faida Watchlist Screenshot")
     with col2:
-        notes = st.text_area("Notes (optional)", placeholder="Any notes about the market today...")
+        notes = st.text_area("Notes (optional)", placeholder="Any notes about today's watchlist...")
 
     file = st.file_uploader("Upload screenshot (PNG/JPG/WEBP)", type=["png", "jpg", "jpeg", "webp"])
 
-    st.markdown("### OCR tuning (if extraction misses rows)")
-    t1, t2, t3, t4 = st.columns(4)
+    st.markdown("### Crop & OCR tuning (critical for full-screen Faida screenshots)")
+    t1, t2, t3, t4, t5 = st.columns(5)
     with t1:
-        crop_right_pct = st.slider("Crop right side (%)", 0.0, 0.5, 0.30, 0.01)
+        crop_left_pct = st.slider("Crop LEFT (%)", 0.0, 0.6, 0.20, 0.01)
     with t2:
-        crop_top_pct = st.slider("Crop top (%)", 0.0, 0.3, 0.00, 0.01)
+        crop_right_pct = st.slider("Crop RIGHT (%)", 0.0, 0.6, 0.35, 0.01)
     with t3:
-        crop_bottom_pct = st.slider("Crop bottom (%)", 0.0, 0.3, 0.00, 0.01)
+        crop_top_pct = st.slider("Crop TOP (%)", 0.0, 0.4, 0.10, 0.01)
     with t4:
+        crop_bottom_pct = st.slider("Crop BOTTOM (%)", 0.0, 0.4, 0.10, 0.01)
+    with t5:
         upscale = st.slider("Upscale", 1.0, 3.0, 2.5, 0.1)
 
     if file:
@@ -351,29 +374,27 @@ with tab_upload:
 
         processed = preprocess_for_ocr(
             pil_img,
+            crop_left_pct=crop_left_pct,
             crop_right_pct=crop_right_pct,
             crop_top_pct=crop_top_pct,
             crop_bottom_pct=crop_bottom_pct,
             upscale=upscale
         )
-        st.image(processed, caption="Preprocessed for OCR", use_container_width=True)
+        st.image(processed, caption="Preprocessed (cropped) for OCR", use_container_width=True)
 
-        if not TESSERACT_OK:
-            st.warning("OCR is not ready on this deployment. Check sidebar status and your packages.txt / requirements.txt.")
+        if not OCR_READY:
+            st.warning("OCR is not ready on this deployment. Check packages.txt + requirements.txt.")
 
-        if st.button("Extract & Save Dataset", type="primary", disabled=not TESSERACT_OK):
-            # Save image to disk
+        if st.button("Extract & Save Dataset", type="primary", disabled=not OCR_READY):
             ts = datetime.now().strftime("%H%M%S")
             safe_name = file.name.replace("/", "_").replace("\\", "_").replace("..", "_")
             out_name = f"{quote_date.isoformat()}__{ts}__{safe_name}"
             out_path = UPLOAD_DIR / out_name
             pil_img.save(out_path)
 
-            # OCR + parse
             ocr_text = ocr_image(processed)
-            quotes = parse_ocr_text_to_quotes(ocr_text)
+            rows = parse_watchlist_rows(ocr_text)
 
-            # store upload
             upload_id = insert_upload(
                 upload_date=quote_date.isoformat(),
                 label=label.strip() if label else None,
@@ -385,23 +406,25 @@ with tab_upload:
                 ocr_text=ocr_text
             )
 
-            # store quotes
-            if quotes:
-                insert_quotes(upload_id=upload_id, quote_date=quote_date.isoformat(), quotes=quotes)
+            if rows:
+                insert_watchlist_rows(upload_id=upload_id, quote_date=quote_date.isoformat(), rows=rows)
 
-            st.success(f"Saved upload + extracted **{len(quotes)}** rows into dataset ✅")
+            st.success(f"Saved upload + extracted **{len(rows)}** rows ✅")
 
-            st.markdown("#### Extracted rows preview")
-            if len(quotes) == 0:
-                st.warning("No rows were extracted. Try increasing crop-right (0.30–0.38) and upscale (2.5–3.0).")
+            st.markdown("### Extracted rows preview (correct columns)")
+            if not rows:
+                st.warning("No rows extracted. Increase crop (left/right/top/bottom) until ONLY the watchlist table remains.")
                 with st.expander("Show OCR raw text (debug)"):
                     st.code(ocr_text[:12000])
             else:
-                df_preview = pd.DataFrame(quotes)
-                df_preview["volume"] = pd.to_numeric(df_preview.get("volume"), errors="coerce")
-                df_preview["last_price"] = pd.to_numeric(df_preview.get("last_price"), errors="coerce")
-                df_preview = df_preview.sort_values(["volume", "symbol"], ascending=[False, True])
-                st.dataframe(df_preview, use_container_width=True)
+                df_preview = pd.DataFrame(rows)
+                df_preview["last_price"] = pd.to_numeric(df_preview["last_price"], errors="coerce")
+                df_preview["last_qty"] = pd.to_numeric(df_preview["last_qty"], errors="coerce")
+                df_preview["bid_qty"] = pd.to_numeric(df_preview["bid_qty"], errors="coerce")
+                df_preview["bid_price"] = pd.to_numeric(df_preview["bid_price"], errors="coerce")
+
+                df_preview = df_preview.sort_values(["bid_qty", "last_qty", "symbol"], ascending=[False, False, True])
+                st.dataframe(df_preview[["symbol","last_price","last_qty","bid_qty","bid_price"]], use_container_width=True)
 
                 with st.expander("Show OCR raw text"):
                     st.code(ocr_text[:12000])
@@ -410,60 +433,62 @@ with tab_upload:
 # Dashboard
 # ----------------------------
 with tab_dashboard:
-    st.subheader("Market Dashboard (from your screenshot dataset)")
+    st.subheader("Dashboard (from extracted dataset)")
 
-    dates_df = pd.read_sql_query("SELECT DISTINCT quote_date FROM market_quotes ORDER BY quote_date DESC", CONN)
+    dates_df = pd.read_sql_query("SELECT DISTINCT quote_date FROM watchlist_rows ORDER BY quote_date DESC", CONN)
     available_dates = dates_df["quote_date"].tolist() if not dates_df.empty else []
 
     if not available_dates:
-        st.info("No dataset yet. Go to **Upload + Extract** and upload your first screenshot.")
+        st.info("No dataset yet. Upload a screenshot in **Upload + Extract**.")
     else:
-        c0, c1, c2 = st.columns([1, 1, 1])
-        with c0:
-            mode = st.selectbox("View", ["Latest date", "Pick a date"])
+        c1, c2, c3 = st.columns([1, 1, 1])
         with c1:
-            pick_date = st.selectbox("Date", available_dates, disabled=(mode == "Latest date"))
+            mode = st.selectbox("View", ["Latest date", "Pick a date"])
         with c2:
-            symbol_filter = st.text_input("Filter symbol (optional)", placeholder="e.g., SCBK")
+            pick_date = st.selectbox("Date", available_dates, disabled=(mode == "Latest date"))
+        with c3:
+            symbol_filter = st.text_input("Filter symbol (optional)", placeholder="e.g., ABSA")
 
         date_to_use = available_dates[0] if mode == "Latest date" else pick_date
 
-        quotes_df = fetch_quotes(date_filter=date_to_use, symbol=symbol_filter if symbol_filter else None)
-        if quotes_df.empty:
+        df = fetch_watchlist(date_filter=date_to_use, symbol=symbol_filter if symbol_filter else None)
+        if df.empty:
             st.warning("No rows match your filters.")
         else:
-            quotes_df = quotes_df.copy()
-            quotes_df["volume"] = pd.to_numeric(quotes_df["volume"], errors="coerce")
-            quotes_df["last_price"] = pd.to_numeric(quotes_df["last_price"], errors="coerce")
-            quotes_df["notional"] = quotes_df["volume"].fillna(0) * quotes_df["last_price"].fillna(0)
+            df = df.copy()
+            df["last_price"] = pd.to_numeric(df["last_price"], errors="coerce")
+            df["last_qty"] = pd.to_numeric(df["last_qty"], errors="coerce")
+            df["bid_qty"] = pd.to_numeric(df["bid_qty"], errors="coerce")
+            df["bid_price"] = pd.to_numeric(df["bid_price"], errors="coerce")
 
-            st.markdown(f"### Dataset date: **{date_to_use}**  | Rows: **{len(quotes_df)}**")
+            df["notional_last"] = df["last_price"].fillna(0) * df["last_qty"].fillna(0)
+            df["notional_bid"] = df["bid_price"].fillna(0) * df["bid_qty"].fillna(0)
 
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total Volume", f"{int(quotes_df['volume'].fillna(0).sum()):,}")
-            m2.metric("Total Notional (approx)", f"{float(quotes_df['notional'].fillna(0).sum()):,.2f}")
-            m3.metric("Unique Symbols", f"{quotes_df['symbol'].nunique():,}")
-            m4.metric("Uploads used", f"{quotes_df['upload_id'].nunique():,}")
+            m1.metric("Symbols", f"{df['symbol'].nunique():,}")
+            m2.metric("Total Last Qty", f"{int(df['last_qty'].fillna(0).sum()):,}")
+            m3.metric("Total Bid Qty", f"{int(df['bid_qty'].fillna(0).sum()):,}")
+            m4.metric("Uploads used", f"{df['upload_id'].nunique():,}")
 
-            st.markdown("### Full table")
+            st.markdown("### Full Watchlist Table")
             st.dataframe(
-                quotes_df[["symbol", "last_price", "volume", "notional", "direction", "quote_date", "upload_id"]]
-                .sort_values(["notional", "volume"], ascending=False),
+                df[["symbol","last_price","last_qty","bid_qty","bid_price","notional_last","notional_bid"]]
+                .sort_values(["notional_bid","bid_qty"], ascending=False),
                 use_container_width=True
             )
 
-            st.markdown("### Top by Volume")
+            st.markdown("### Top Bid Qty")
             st.dataframe(
-                quotes_df[["symbol", "last_price", "volume"]]
-                .sort_values("volume", ascending=False)
+                df[["symbol","bid_qty","bid_price","notional_bid"]]
+                .sort_values("bid_qty", ascending=False)
                 .head(25),
                 use_container_width=True
             )
 
-            st.markdown("### Top by Notional (Volume × Price)")
+            st.markdown("### Top Last Qty (Most traded in your watchlist)")
             st.dataframe(
-                quotes_df[["symbol", "last_price", "volume", "notional"]]
-                .sort_values("notional", ascending=False)
+                df[["symbol","last_qty","last_price","notional_last"]]
+                .sort_values("last_qty", ascending=False)
                 .head(25),
                 use_container_width=True
             )
@@ -472,19 +497,19 @@ with tab_dashboard:
 # Downloads
 # ----------------------------
 with tab_downloads:
-    st.subheader("Download your dataset")
+    st.subheader("Download dataset (correct column names)")
 
-    uploads_df = fetch_uploads(upload_date=None, limit=100000)
-    quotes_all = fetch_quotes(date_filter=None, symbol=None, limit=200000)
+    uploads_df = fetch_uploads(limit=100000)
+    watch_df = fetch_watchlist(date_filter=None, symbol=None, limit=200000)
 
     st.write(f"Uploads stored: **{len(uploads_df)}**")
-    st.write(f"Quote rows stored: **{len(quotes_all)}**")
+    st.write(f"Extracted watchlist rows stored: **{len(watch_df)}**")
 
-    if not quotes_all.empty:
+    if not watch_df.empty:
         st.download_button(
-            "Download quotes.csv",
-            data=quotes_all.to_csv(index=False).encode("utf-8"),
-            file_name="quotes.csv",
+            "Download watchlist_rows.csv",
+            data=watch_df.to_csv(index=False).encode("utf-8"),
+            file_name="watchlist_rows.csv",
             mime="text/csv"
         )
 
@@ -496,18 +521,17 @@ with tab_downloads:
             mime="text/csv"
         )
 
-    if (not uploads_df.empty) and (not quotes_all.empty):
-        zip_bytes = build_zip_bytes(quotes_all, uploads_df)
+    if (not uploads_df.empty) and (not watch_df.empty):
+        zip_bytes = build_zip_bytes(watch_df, uploads_df)
         st.download_button(
             "Download FULL export (ZIP: images + dataset)",
             data=zip_bytes,
-            file_name="nse_screenshot_dataset_export.zip",
+            file_name="faida_watchlist_export.zip",
             mime="application/zip"
         )
 
     st.divider()
-    st.markdown("#### Storage note (Streamlit Cloud)")
     st.info(
         "Streamlit Cloud storage can reset on rebuild/restart. "
-        "Use the downloads above to keep a permanent copy of your dataset."
+        "Download your dataset regularly (CSV/ZIP) to keep a permanent copy."
     )
