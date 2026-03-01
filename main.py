@@ -1,21 +1,7 @@
-# main.py
-# Streamlit app: Daily manual screenshot uploads + optional OCR + export/download (ZIP + CSV)
-#
-# Run:
-#   pip install streamlit pandas pillow
-# Optional OCR (recommended):
-#   pip install pytesseract
-#   # AND install the Tesseract engine on your machine (Windows/Linux/Mac) then ensure it's in PATH.
-#
-# Start:
-#   streamlit run main.py
-
 import os
 import io
 import re
-import csv
 import json
-import time
 import sqlite3
 import zipfile
 from pathlib import Path
@@ -25,10 +11,30 @@ import streamlit as st
 import pandas as pd
 from PIL import Image
 
+import shutil
+import streamlit as st
+
+tess_path = shutil.which("tesseract")
+if tess_path:
+    st.sidebar.success(f"Tesseract found: {tess_path}")
+else:
+    st.sidebar.error("Tesseract NOT found. Add packages.txt with tesseract-ocr.")
+
+# OCR + image processing
+import cv2
+import numpy as np
+
+# Optional: pytesseract (needs tesseract installed in OS)
+try:
+    import pytesseract
+    TESSERACT_OK = True
+except Exception:
+    TESSERACT_OK = False
+
 # ----------------------------
 # App config
 # ----------------------------
-APP_TITLE = "NSE Dashboard — Daily Uploads + OCR + Downloads"
+APP_TITLE = "NSE Screenshot → Dataset + Dashboard"
 DATA_DIR = Path("data")
 UPLOAD_DIR = DATA_DIR / "screenshots"
 DB_PATH = DATA_DIR / "app.db"
@@ -38,13 +44,14 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Upload screenshots daily, optionally run OCR, and download everything anytime (ZIP + CSV).")
+st.caption("Upload NSE market screenshots, extract table data, store a dataset, and view dashboards.")
 
 # ----------------------------
 # DB helpers
 # ----------------------------
 def db_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    # uploads table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS uploads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,9 +65,26 @@ def db_conn():
             ocr_text TEXT
         )
     """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_uploads_date ON uploads(upload_date)")
+
+    # extracted quotes table (dataset)
     conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_uploads_date ON uploads(upload_date)
+        CREATE TABLE IF NOT EXISTS market_quotes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            upload_id INTEGER NOT NULL,
+            quote_date TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            last_price REAL,
+            volume INTEGER,
+            direction TEXT,   -- UP / DOWN / FLAT / UNKNOWN
+            raw_line TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(upload_id) REFERENCES uploads(id)
+        )
     """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quotes_date ON market_quotes(quote_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_quotes_symbol ON market_quotes(symbol)")
+
     conn.commit()
     return conn
 
@@ -68,16 +92,22 @@ CONN = db_conn()
 
 def insert_upload(upload_date: str, label: str | None, notes: str | None,
                   filename: str, filepath: str, mimetype: str | None,
-                  uploaded_at: str, ocr_text: str | None):
-    CONN.execute(
+                  uploaded_at: str, ocr_text: str | None) -> int:
+    cur = CONN.cursor()
+    cur.execute(
         """INSERT INTO uploads
            (upload_date, label, notes, filename, filepath, mimetype, uploaded_at, ocr_text)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (upload_date, label, notes, filename, filepath, mimetype, uploaded_at, ocr_text),
     )
     CONN.commit()
+    return int(cur.lastrowid)
 
-def fetch_uploads(upload_date: str | None = None, limit: int = 500):
+def update_upload_ocr(upload_id: int, ocr_text: str):
+    CONN.execute("UPDATE uploads SET ocr_text = ? WHERE id = ?", (ocr_text, upload_id))
+    CONN.commit()
+
+def fetch_uploads(upload_date: str | None = None, limit: int = 500) -> pd.DataFrame:
     cur = CONN.cursor()
     if upload_date:
         cur.execute(
@@ -100,270 +130,368 @@ def fetch_uploads(upload_date: str | None = None, limit: int = 500):
     cols = ["id", "upload_date", "label", "notes", "filename", "filepath", "mimetype", "uploaded_at", "ocr_text"]
     return pd.DataFrame(rows, columns=cols)
 
-def get_upload_by_id(row_id: int):
+def fetch_quotes(date_filter: str | None = None, symbol: str | None = None, limit: int = 50000) -> pd.DataFrame:
     cur = CONN.cursor()
-    cur.execute(
-        """SELECT id, upload_date, label, notes, filename, filepath, mimetype, uploaded_at, ocr_text
-           FROM uploads WHERE id = ?""",
-        (row_id,),
-    )
-    r = cur.fetchone()
-    if not r:
-        return None
-    cols = ["id", "upload_date", "label", "notes", "filename", "filepath", "mimetype", "uploaded_at", "ocr_text"]
-    return dict(zip(cols, r))
+    q = """SELECT id, upload_id, quote_date, symbol, last_price, volume, direction, raw_line, created_at
+           FROM market_quotes WHERE 1=1"""
+    params = []
+    if date_filter:
+        q += " AND quote_date = ?"
+        params.append(date_filter)
+    if symbol:
+        q += " AND symbol = ?"
+        params.append(symbol.upper().strip())
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+    cur.execute(q, tuple(params))
+    rows = cur.fetchall()
+    cols = ["id","upload_id","quote_date","symbol","last_price","volume","direction","raw_line","created_at"]
+    return pd.DataFrame(rows, columns=cols)
 
-def update_ocr(row_id: int, ocr_text: str):
-    CONN.execute("UPDATE uploads SET ocr_text = ? WHERE id = ?", (ocr_text, row_id))
+def insert_quotes(upload_id: int, quote_date: str, quotes: list[dict]):
+    now = datetime.now().isoformat(timespec="seconds")
+    cur = CONN.cursor()
+    for r in quotes:
+        cur.execute(
+            """INSERT INTO market_quotes
+               (upload_id, quote_date, symbol, last_price, volume, direction, raw_line, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                upload_id,
+                quote_date,
+                r.get("symbol"),
+                r.get("last_price"),
+                r.get("volume"),
+                r.get("direction"),
+                r.get("raw_line"),
+                now,
+            )
+        )
     CONN.commit()
 
-def delete_upload(row_id: int):
-    item = get_upload_by_id(row_id)
-    if not item:
-        return False
-    fp = item["filepath"]
-    try:
-        if fp and os.path.exists(fp):
-            os.remove(fp)
-    except Exception:
-        pass
-    CONN.execute("DELETE FROM uploads WHERE id = ?", (row_id,))
-    CONN.commit()
-    return True
-
 # ----------------------------
-# OCR helpers (optional)
+# OCR + parsing
 # ----------------------------
-def ocr_available() -> bool:
-    try:
-        import pytesseract  # noqa: F401
-        return True
-    except Exception:
-        return False
+def preprocess_for_ocr(pil_img: Image.Image,
+                       crop_right_pct: float = 0.22,
+                       crop_top_pct: float = 0.00,
+                       crop_bottom_pct: float = 0.00,
+                       upscale: float = 2.0) -> np.ndarray:
+    """
+    Preprocess screenshot:
+    - Convert to OpenCV
+    - Crop out right-side buttons area (B/S/trash)
+    - Optional crop top/bottom
+    - Upscale
+    - Grayscale + threshold
+    """
+    img = np.array(pil_img.convert("RGB"))
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-def run_ocr_on_image(image_path: str) -> str:
-    import pytesseract
-    img = Image.open(image_path).convert("RGB")
-    # Light pre-processing: increase contrast by converting to grayscale sometimes helps.
-    # Keep it simple/robust:
-    return pytesseract.image_to_string(img)
+    h, w = img.shape[:2]
+    right_crop = int(w * (1.0 - crop_right_pct))
+    top_crop = int(h * crop_top_pct)
+    bottom_crop = int(h * (1.0 - crop_bottom_pct))
+
+    img = img[top_crop:bottom_crop, :right_crop]
+
+    if upscale and upscale != 1.0:
+        img = cv2.resize(img, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Improve contrast
+    gray = cv2.bilateralFilter(gray, 7, 50, 50)
+
+    # Threshold (works well on dark UI)
+    _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Sometimes invert helps depending on colors
+    # We'll auto-detect: if background becomes mostly white, keep; else invert
+    white_ratio = (th > 200).mean()
+    if white_ratio < 0.5:
+        th = cv2.bitwise_not(th)
+
+    return th
+
+def ocr_image(cv_img: np.ndarray) -> str:
+    if not TESSERACT_OK:
+        raise RuntimeError("pytesseract not installed. Run: pip install pytesseract (and install tesseract engine).")
+
+    # OCR config tuned for table-like lines
+    config = r"--oem 3 --psm 6"
+    text = pytesseract.image_to_string(cv_img, config=config)
+    return text
+
+ROW_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<symbol>[A-Z0-9\-]{2,10})     # SYMBOL like SCBK, KPLC-P
+    \s+
+    (?P<price>\d{1,3}(?:,\d{3})*(?:\.\d+)?)  # PRICE like 365.00 or 1,500.00
+    \s+
+    (?P<volume>\d{1,3}(?:,\d{3})*)  # VOLUME like 6669 or 25,000,000
+    """,
+    re.VERBOSE
+)
+
+def parse_ocr_text_to_quotes(ocr_text: str) -> list[dict]:
+    """
+    Extract rows that look like:
+    SYMBOL  PRICE  VOLUME
+    We ignore any weird lines.
+    """
+    quotes = []
+    for line in ocr_text.splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+
+        # clean common OCR junk
+        raw = raw.replace("O", "0") if re.search(r"\b\d+O\d+\b", raw) else raw
+
+        m = ROW_RE.match(raw)
+        if not m:
+            continue
+
+        symbol = m.group("symbol").upper().strip()
+        price_str = m.group("price").replace(",", "")
+        vol_str = m.group("volume").replace(",", "")
+
+        try:
+            last_price = float(price_str)
+        except Exception:
+            last_price = None
+
+        try:
+            volume = int(vol_str)
+        except Exception:
+            volume = None
+
+        # We can’t reliably OCR the arrow icons, so default UNKNOWN.
+        # Later: infer direction if you also capture change column.
+        direction = "UNKNOWN"
+
+        quotes.append({
+            "symbol": symbol,
+            "last_price": last_price,
+            "volume": volume,
+            "direction": direction,
+            "raw_line": raw
+        })
+
+    # de-duplicate by symbol (keep last)
+    dedup = {}
+    for q in quotes:
+        dedup[q["symbol"]] = q
+    return list(dedup.values())
 
 # ----------------------------
 # Export helpers
 # ----------------------------
-def build_metadata_csv_bytes(df: pd.DataFrame) -> bytes:
-    out = io.StringIO()
-    df.to_csv(out, index=False)
-    return out.getvalue().encode("utf-8")
-
-def build_zip_bytes(df: pd.DataFrame, include_images: bool = True, include_ocr_txt: bool = True) -> bytes:
+def build_zip_bytes(quotes_df: pd.DataFrame, uploads_df: pd.DataFrame) -> bytes:
     bio = io.BytesIO()
     with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
-        # metadata
-        z.writestr("metadata.csv", build_metadata_csv_bytes(df))
-        # also dump JSON for easy programmatic use
-        z.writestr("metadata.json", json.dumps(df.fillna("").to_dict(orient="records"), indent=2))
+        z.writestr("quotes.csv", quotes_df.to_csv(index=False))
+        z.writestr("uploads.csv", uploads_df.to_csv(index=False))
+        z.writestr("quotes.json", json.dumps(quotes_df.fillna("").to_dict(orient="records"), indent=2))
+        z.writestr("uploads.json", json.dumps(uploads_df.fillna("").to_dict(orient="records"), indent=2))
 
-        # images + OCR text files
-        if include_images or include_ocr_txt:
-            for _, row in df.iterrows():
-                upload_date = row["upload_date"]
-                label = (row["label"] or "").strip() if isinstance(row["label"], str) else ""
-                safe_label = re.sub(r"[^a-zA-Z0-9_\-]+", "_", label)[:40] if label else "unlabeled"
-                base_folder = f"uploads/{upload_date}/{safe_label}/"
-
-                if include_images:
-                    fp = row["filepath"]
-                    if isinstance(fp, str) and fp and os.path.exists(fp):
-                        # keep original filename inside zip
-                        z.write(fp, arcname=base_folder + row["filename"])
-
-                if include_ocr_txt:
-                    text = row["ocr_text"]
-                    if isinstance(text, str) and text.strip():
-                        txt_name = row["filename"] + ".txt"
-                        z.writestr(base_folder + txt_name, text)
+        # include uploaded images
+        for _, r in uploads_df.iterrows():
+            fp = r["filepath"]
+            if isinstance(fp, str) and fp and os.path.exists(fp):
+                z.write(fp, arcname=f"screenshots/{r['filename']}")
     bio.seek(0)
     return bio.read()
 
 # ----------------------------
-# UI
+# UI tabs
 # ----------------------------
-tab_upload, tab_gallery, tab_downloads = st.tabs(["📤 Upload", "🖼️ Gallery", "⬇️ Downloads"])
+tab_upload, tab_dashboard, tab_downloads = st.tabs(["📤 Upload + Extract", "📊 Dashboard", "⬇️ Download Dataset"])
 
+# ----------------------------
+# Upload + Extract
+# ----------------------------
 with tab_upload:
-    st.subheader("Upload screenshots (daily)")
-    left, right = st.columns([1, 1])
+    st.subheader("1) Upload screenshot  2) Extract table  3) Save dataset")
 
-    with left:
-        upload_date = st.date_input("Date", value=date.today())
-        label = st.text_input("Label (optional)", placeholder="e.g., Daily Price List / Portfolio / Watchlist")
-    with right:
-        notes = st.text_area("Notes (optional)", placeholder="Market notes, setups, why you’re watching a counter, etc.")
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        upload_date = st.date_input("Quote date", value=date.today())
+        label = st.text_input("Label (optional)", value="NSE Market Watch Screenshot")
+    with col2:
+        notes = st.text_area("Notes (optional)", placeholder="Any notes about the market today...")
 
-    files = st.file_uploader(
-        "Choose screenshot(s) (PNG/JPG/WEBP)",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True
-    )
+    file = st.file_uploader("Upload screenshot (PNG/JPG/WEBP)", type=["png", "jpg", "jpeg", "webp"])
 
-    ocr_toggle = st.checkbox("Run OCR on upload (requires pytesseract + Tesseract installed)", value=False)
+    if not TESSERACT_OK:
+        st.warning("OCR not ready. Install: pip install pytesseract, and install Tesseract engine on your OS.")
 
-    if ocr_toggle and not ocr_available():
-        st.warning("OCR library not found. Install with: pip install pytesseract (and install Tesseract engine).")
+    st.markdown("### OCR tuning (if extraction misses rows)")
+    tune1, tune2, tune3, tune4 = st.columns(4)
+    with tune1:
+        crop_right_pct = st.slider("Crop right side (%)", 0.0, 0.5, 0.22, 0.01)
+    with tune2:
+        crop_top_pct = st.slider("Crop top (%)", 0.0, 0.3, 0.00, 0.01)
+    with tune3:
+        crop_bottom_pct = st.slider("Crop bottom (%)", 0.0, 0.3, 0.00, 0.01)
+    with tune4:
+        upscale = st.slider("Upscale", 1.0, 3.0, 2.0, 0.1)
 
-    if st.button("Save Uploads", type="primary", disabled=not files):
-        saved = 0
-        for f in files:
+    if file:
+        pil_img = Image.open(file)
+        st.image(pil_img, caption="Uploaded screenshot", use_container_width=True)
+
+        processed = preprocess_for_ocr(
+            pil_img,
+            crop_right_pct=crop_right_pct,
+            crop_top_pct=crop_top_pct,
+            crop_bottom_pct=crop_bottom_pct,
+            upscale=upscale
+        )
+        st.image(processed, caption="Preprocessed for OCR", use_container_width=True)
+
+        if st.button("Extract & Save Dataset", type="primary", disabled=not TESSERACT_OK):
+            # save image to disk
             ts = datetime.now().strftime("%H%M%S")
-            safe_name = f.name.replace("/", "_").replace("\\", "_").replace("..", "_")
+            safe_name = file.name.replace("/", "_").replace("\\", "_").replace("..", "_")
             out_name = f"{upload_date.isoformat()}__{ts}__{safe_name}"
             out_path = UPLOAD_DIR / out_name
+            pil_img.save(out_path)
 
-            with open(out_path, "wb") as out:
-                out.write(f.getbuffer())
+            # OCR
+            ocr_text = ocr_image(processed)
+            quotes = parse_ocr_text_to_quotes(ocr_text)
 
-            ocr_text = None
-            if ocr_toggle and ocr_available():
-                try:
-                    ocr_text = run_ocr_on_image(str(out_path))
-                except Exception as e:
-                    ocr_text = f"[OCR FAILED] {e}"
-
-            insert_upload(
+            # store upload
+            upload_id = insert_upload(
                 upload_date=upload_date.isoformat(),
-                label=(label.strip() if label else None),
-                notes=(notes.strip() if notes else None),
+                label=label.strip() if label else None,
+                notes=notes.strip() if notes else None,
                 filename=out_name,
                 filepath=str(out_path),
-                mimetype=getattr(f, "type", None),
+                mimetype=getattr(file, "type", None),
                 uploaded_at=datetime.now().isoformat(timespec="seconds"),
                 ocr_text=ocr_text
             )
-            saved += 1
 
-        st.success(f"Saved {saved} screenshot(s) for {upload_date.isoformat()} ✅")
-        st.rerun()
+            # store quotes
+            insert_quotes(upload_id=upload_id, quote_date=upload_date.isoformat(), quotes=quotes)
 
-    st.divider()
-    st.markdown("#### Today’s quick preview")
-    df_today = fetch_uploads(upload_date=date.today().isoformat(), limit=24)
-    if df_today.empty:
-        st.info("No uploads for today yet.")
-    else:
-        cols = st.columns(4)
-        for i, row in df_today.iterrows():
-            with cols[i % 4]:
-                st.image(row["filepath"], use_container_width=True)
-                st.caption(f"**{row['label'] or 'Screenshot'}** · {row['uploaded_at']}")
-                if isinstance(row["notes"], str) and row["notes"].strip():
-                    st.write(row["notes"][:180] + ("…" if len(row["notes"]) > 180 else ""))
+            st.success(f"Saved upload + extracted **{len(quotes)}** rows into dataset ✅")
 
-with tab_gallery:
-    st.subheader("Gallery / History")
+            st.markdown("#### Extracted rows preview")
+            df_preview = pd.DataFrame(quotes).sort_values(["volume","symbol"], ascending=[False, True])
+            st.dataframe(df_preview, use_container_width=True)
+
+            with st.expander("Show OCR raw text"):
+                st.code(ocr_text[:12000])
+
+# ----------------------------
+# Dashboard
+# ----------------------------
+with tab_dashboard:
+    st.subheader("Market Dashboard (from your screenshot dataset)")
+
     top = st.columns([1, 1, 1, 1])
     with top[0]:
-        show_all = st.checkbox("Show all dates", value=True)
+        mode = st.selectbox("View", ["Latest date", "Pick a date"])
     with top[1]:
-        filter_date = st.date_input("Filter date", value=date.today())
+        # available dates
+        dates_df = pd.read_sql_query("SELECT DISTINCT quote_date FROM market_quotes ORDER BY quote_date DESC", CONN)
+        available_dates = dates_df["quote_date"].tolist() if not dates_df.empty else []
+        pick_date = st.selectbox("Date", available_dates, disabled=(mode == "Latest date"))
     with top[2]:
-        max_rows = st.number_input("Max rows", min_value=50, max_value=2000, value=500, step=50)
+        symbol_filter = st.text_input("Filter symbol (optional)", placeholder="e.g., SCBK")
     with top[3]:
-        st.write("")  # spacer
+        st.write("")
 
-    query_date = None if show_all else filter_date.isoformat()
-    df = fetch_uploads(upload_date=query_date, limit=int(max_rows))
-
-    if df.empty:
-        st.info("No screenshots found.")
+    if not available_dates:
+        st.info("No dataset yet. Go to **Upload + Extract** and upload your first screenshot.")
     else:
-        # Group by date
-        for d in sorted(df["upload_date"].unique(), reverse=True):
-            df_d = df[df["upload_date"] == d].copy()
-            with st.expander(f"{d} — {len(df_d)} upload(s)", expanded=(d == date.today().isoformat())):
-                grid = st.columns(4)
-                for i, row in df_d.iterrows():
-                    with grid[i % 4]:
-                        st.image(row["filepath"], use_container_width=True)
-                        st.caption(f"**{row['label'] or 'Screenshot'}** · {row['uploaded_at']}")
-                        if isinstance(row["notes"], str) and row["notes"].strip():
-                            st.write(row["notes"])
-                        # OCR box
-                        if isinstance(row["ocr_text"], str) and row["ocr_text"].strip():
-                            with st.popover("View OCR text"):
-                                st.code(row["ocr_text"][:8000])
-                        else:
-                            # Allow OCR later on demand
-                            if st.button("Run OCR now", key=f"ocr_{int(row['id'])}", disabled=not ocr_available()):
-                                try:
-                                    txt = run_ocr_on_image(row["filepath"])
-                                    update_ocr(int(row["id"]), txt)
-                                    st.success("OCR saved.")
-                                    st.rerun()
-                                except Exception as e:
-                                    st.error(f"OCR failed: {e}")
+        date_to_use = available_dates[0] if mode == "Latest date" else pick_date
 
-                        # Delete
-                        if st.button("Delete", key=f"del_{int(row['id'])}"):
-                            ok = delete_upload(int(row["id"]))
-                            if ok:
-                                st.warning("Deleted.")
-                                st.rerun()
+        quotes_df = fetch_quotes(date_filter=date_to_use, symbol=symbol_filter if symbol_filter else None)
+        if quotes_df.empty:
+            st.warning("No rows match your filters.")
+        else:
+            # clean
+            quotes_df = quotes_df.copy()
+            quotes_df["volume"] = pd.to_numeric(quotes_df["volume"], errors="coerce")
+            quotes_df["last_price"] = pd.to_numeric(quotes_df["last_price"], errors="coerce")
+            quotes_df["notional"] = quotes_df["volume"] * quotes_df["last_price"]
 
-    st.divider()
-    st.markdown("#### Uploads table (for quick searching)")
-    st.dataframe(
-        df[["id", "upload_date", "label", "notes", "filename", "uploaded_at"]].head(300),
-        use_container_width=True
-    )
+            st.markdown(f"### Dataset date: **{date_to_use}**  | Rows: **{len(quotes_df)}**")
 
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Volume", f"{int(quotes_df['volume'].fillna(0).sum()):,}")
+            c2.metric("Total Notional (approx)", f"{float(quotes_df['notional'].fillna(0).sum()):,.2f}")
+            c3.metric("Unique Symbols", f"{quotes_df['symbol'].nunique():,}")
+            c4.metric("Uploads used", f"{quotes_df['upload_id'].nunique():,}")
+
+            st.markdown("### Full table")
+            st.dataframe(
+                quotes_df[["symbol","last_price","volume","notional","direction","quote_date","upload_id"]]
+                .sort_values(["notional","volume"], ascending=False),
+                use_container_width=True
+            )
+
+            st.markdown("### Top by Volume")
+            st.dataframe(
+                quotes_df[["symbol","last_price","volume"]]
+                .sort_values("volume", ascending=False)
+                .head(20),
+                use_container_width=True
+            )
+
+            st.markdown("### Top by Notional (Volume × Price)")
+            st.dataframe(
+                quotes_df[["symbol","last_price","volume","notional"]]
+                .sort_values("notional", ascending=False)
+                .head(20),
+                use_container_width=True
+            )
+
+# ----------------------------
+# Downloads
+# ----------------------------
 with tab_downloads:
-    st.subheader("Download your stored data")
-    st.caption("Export metadata (CSV) and/or everything (ZIP with images + OCR text).")
+    st.subheader("Download your dataset")
 
-    df_all = fetch_uploads(upload_date=None, limit=100000)  # safe for most personal apps
-    st.write(f"Total uploads stored: **{len(df_all)}**")
+    uploads_df = fetch_uploads(upload_date=None, limit=100000)
+    quotes_all = fetch_quotes(date_filter=None, symbol=None, limit=200000)
 
-    colA, colB = st.columns([1, 1])
-    with colA:
-        export_date_mode = st.selectbox("Export scope", ["All dates", "Single date"])
-        export_date = st.date_input("Export date", value=date.today(), disabled=(export_date_mode == "All dates"))
+    st.write(f"Uploads stored: **{len(uploads_df)}**")
+    st.write(f"Quote rows stored: **{len(quotes_all)}**")
 
-    with colB:
-        include_images = st.checkbox("Include images in ZIP", value=True)
-        include_ocr_txt = st.checkbox("Include OCR text files in ZIP", value=True)
-
-    if export_date_mode == "Single date":
-        df_export = df_all[df_all["upload_date"] == export_date.isoformat()].copy()
-    else:
-        df_export = df_all.copy()
-
-    st.write(f"Items to export: **{len(df_export)}**")
-
-    # CSV download (metadata)
-    csv_bytes = build_metadata_csv_bytes(df_export)
-    st.download_button(
-        "Download metadata.csv",
-        data=csv_bytes,
-        file_name="metadata.csv",
-        mime="text/csv",
-        disabled=df_export.empty
-    )
-
-    # ZIP download (everything)
-    # Build ZIP only when user clicks to avoid slow UI
-    if st.button("Build ZIP for download", type="primary", disabled=df_export.empty):
-        with st.spinner("Building ZIP..."):
-            zip_bytes = build_zip_bytes(df_export, include_images=include_images, include_ocr_txt=include_ocr_txt)
+    if not quotes_all.empty:
         st.download_button(
-            "Download uploads_export.zip",
+            "Download quotes.csv",
+            data=quotes_all.to_csv(index=False).encode("utf-8"),
+            file_name="quotes.csv",
+            mime="text/csv"
+        )
+
+    if not uploads_df.empty:
+        st.download_button(
+            "Download uploads.csv",
+            data=uploads_df.to_csv(index=False).encode("utf-8"),
+            file_name="uploads.csv",
+            mime="text/csv"
+        )
+
+    if not uploads_df.empty and not quotes_all.empty:
+        zip_bytes = build_zip_bytes(quotes_all, uploads_df)
+        st.download_button(
+            "Download FULL export (ZIP: images + dataset)",
             data=zip_bytes,
-            file_name="uploads_export.zip",
+            file_name="nse_screenshot_dataset_export.zip",
             mime="application/zip"
         )
 
     st.divider()
-    st.markdown("#### Where your data is stored on disk")
+    st.markdown("#### Data storage location")
     st.code(f"""
 {DATA_DIR.resolve()}/
   app.db
